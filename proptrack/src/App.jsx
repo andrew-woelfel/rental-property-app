@@ -78,6 +78,34 @@ const uid     = () => Date.now().toString(36) + Math.random().toString(36).slice
 const curYear = () => new Date().getFullYear().toString();
 const curMon  = () => new Date().getMonth();
 
+// IRS 27.5-year straight-line MACRS with mid-month convention for residential rental improvements.
+// Assets are treated as placed in service on the 15th of the month.
+function calcDepreciationForYear(improvement, taxYear) {
+  if (!improvement.date || !improvement.amount || improvement.status !== "complete") return 0;
+  const amount = parseFloat(improvement.amount);
+  if (!amount || amount <= 0) return 0;
+  const [yearStr, monthStr] = improvement.date.split("-");
+  const P = parseInt(yearStr);
+  const M = parseInt(monthStr); // 1=Jan, 12=Dec
+  const T = parseInt(taxYear);
+  if (isNaN(P) || isNaN(M) || isNaN(T)) return 0;
+  const annual = amount / 27.5;
+  const offset = T - P; // 0 = placed-in-service year
+  if (offset < 0) return 0;
+  if (offset === 0) return annual * (12.5 - M) / 12;
+  // M ≤ 6: final depreciation year is P+27 (28 calendar years total)
+  // M > 6: final depreciation year is P+28 (29 calendar years total)
+  if (M <= 6) {
+    if (offset <= 26) return annual;
+    if (offset === 27) return annual * (M + 5.5) / 12;
+    return 0;
+  } else {
+    if (offset <= 27) return annual;
+    if (offset === 28) return annual * (M - 6.5) / 12;
+    return 0;
+  }
+}
+
 async function exportCSV(entries, rentPayments, properties, propId, yearFilter) {
   const { save }          = await import("@tauri-apps/api/dialog");
   const { writeTextFile } = await import("@tauri-apps/api/fs");
@@ -125,14 +153,26 @@ function buildTaxSummary(entries, rentPayments, propId, year) {
     arr.forEach(x=>{const k=x.category||"Other"; m[k]=(m[k]||0)+(parseFloat(x.amount)||0);});
     return Object.entries(m).sort((a,b)=>b[1]-a[1]);
   };
-  const expenses=byType("expense"), fixes=byType("fix"), improvements=byType("improvement");
+  const expenses=byType("expense"), fixes=byType("fix");
+
+  // Depreciation: all improvement entries ever (not just this year) that are still depreciating
+  const allImprovements = entries.filter(x =>
+    x.type==="improvement" && x.status==="complete" && (!pid || x.propertyId===pid)
+  );
+  const depreciationItems = allImprovements
+    .map(imp => ({ ...imp, annualDepr: calcDepreciationForYear(imp, year) }))
+    .filter(item => item.annualDepr > 0)
+    .sort((a, b) => b.date?.localeCompare(a.date) || 0);
+  const totalDepreciation = depreciationItems.reduce((s, x) => s + x.annualDepr, 0);
+
   const rentYr = rentPayments.filter(r=>String(r.year)===year&&r.status==="paid"&&(!pid||r.propertyId===pid));
   const totalRent = rentYr.reduce((s,r)=>s+(parseFloat(r.amountPaid)||0),0);
   return {
     year, totalRent,
-    totalExpenses:sum(expenses), totalRepairs:sum(fixes), totalImprovements:sum(improvements),
-    netIncome: totalRent-sum(expenses)-sum(fixes),
-    expensesByCategory:byCat(expenses), repairsByCategory:byCat(fixes), improvementsByCategory:byCat(improvements),
+    totalExpenses:sum(expenses), totalRepairs:sum(fixes),
+    totalDepreciation, depreciationItems,
+    netIncome: totalRent-sum(expenses)-sum(fixes)-totalDepreciation,
+    expensesByCategory:byCat(expenses), repairsByCategory:byCat(fixes),
   };
 }
 
@@ -661,12 +701,13 @@ export default function App() {
                 </div>
               </div>
 
-              <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:12,marginBottom:16}}>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:12,marginBottom:16}}>
                 {[
-                  {l:"Gross Rent",       v:fmt$(taxData.totalRent),    c:"#c8b870"},
-                  {l:"Expenses",         v:fmt$(taxData.totalExpenses), c:"#ff8080"},
-                  {l:"Repairs",          v:fmt$(taxData.totalRepairs),  c:"#80ffb0"},
-                  {l:"Net Income",       v:fmt$(taxData.netIncome),     c:taxData.netIncome>=0?"#5ce09e":"#ff8080"},
+                  {l:"Gross Rent",    v:fmt$(taxData.totalRent),          c:"#c8b870"},
+                  {l:"Expenses",      v:fmt$(taxData.totalExpenses),       c:"#ff8080"},
+                  {l:"Repairs",       v:fmt$(taxData.totalRepairs),        c:"#80ffb0"},
+                  {l:"Depreciation",  v:fmt$(taxData.totalDepreciation),   c:"#80c0ff"},
+                  {l:"Net Income",    v:fmt$(taxData.netIncome),           c:taxData.netIncome>=0?"#5ce09e":"#ff8080"},
                 ].map((s,i)=>(
                   <div key={i} className="card" style={{borderTop:`2px solid ${s.c}`}}>
                     <div style={{fontSize:10,color:"#444",letterSpacing:".1em",textTransform:"uppercase",marginBottom:7}}>{s.l}</div>
@@ -679,12 +720,9 @@ export default function App() {
                 {[
                   {title:"💸 Operating Expenses", data:taxData.expensesByCategory, total:taxData.totalExpenses, color:"#ff8080"},
                   {title:"🔧 Repairs & Maintenance", data:taxData.repairsByCategory, total:taxData.totalRepairs, color:"#80ffb0"},
-                  {title:"🔨 Capital Improvements", data:taxData.improvementsByCategory, total:taxData.totalImprovements, color:"#80c0ff", note:"depreciate 27.5 yrs"},
-                ].map(({title,data,total,color,note})=>(
+                ].map(({title,data,total,color})=>(
                   <div key={title} className="tsec">
-                    <div style={{fontSize:11,color,letterSpacing:".1em",textTransform:"uppercase",marginBottom:11}}>
-                      {title}{note&&<span style={{fontSize:9,color:"#333",marginLeft:6}}>({note})</span>}
-                    </div>
+                    <div style={{fontSize:11,color,letterSpacing:".1em",textTransform:"uppercase",marginBottom:11}}>{title}</div>
                     {data.length===0?<div style={{fontSize:12,color:"#2a2a2a"}}>None this year</div>
                       :data.map(([cat,amt])=>(
                         <div key={cat} className="trow"><span style={{color:"#666"}}>{cat}</span><span style={{color}}>{fmt$(amt)}</span></div>
@@ -694,6 +732,44 @@ export default function App() {
                     </div>
                   </div>
                 ))}
+
+                {/* Depreciation Schedule */}
+                <div className="tsec" style={{gridColumn:"1 / -1"}}>
+                  <div style={{display:"flex",alignItems:"baseline",gap:8,marginBottom:11}}>
+                    <span style={{fontSize:11,color:"#80c0ff",letterSpacing:".1em",textTransform:"uppercase"}}>🔨 Depreciation Schedule</span>
+                    <span style={{fontSize:9,color:"#333"}}>27.5 yr straight-line · mid-month convention · {taxYear} deductions</span>
+                  </div>
+                  {taxData.depreciationItems.length===0 ? (
+                    <div style={{fontSize:12,color:"#2a2a2a"}}>No capital improvements on record</div>
+                  ) : (<>
+                    <div style={{display:"grid",gridTemplateColumns:"1fr auto auto auto",gap:"4px 16px",marginBottom:4}}>
+                      <span style={{fontSize:10,color:"#333",letterSpacing:".08em"}}>IMPROVEMENT</span>
+                      <span style={{fontSize:10,color:"#333",letterSpacing:".08em",textAlign:"right"}}>IN SERVICE</span>
+                      <span style={{fontSize:10,color:"#333",letterSpacing:".08em",textAlign:"right"}}>COST</span>
+                      <span style={{fontSize:10,color:"#333",letterSpacing:".08em",textAlign:"right"}}>{taxYear} DEDUCTION</span>
+                    </div>
+                    {taxData.depreciationItems.map(item=>{
+                      const isNew = item.date?.startsWith(taxYear);
+                      return (
+                        <div key={item.id} className="trow" style={{display:"grid",gridTemplateColumns:"1fr auto auto auto",gap:"4px 16px",alignItems:"center"}}>
+                          <span style={{color:"#999",fontSize:12,display:"flex",alignItems:"center",gap:5}}>
+                            {item.title}
+                            {isNew&&<span style={{fontSize:9,background:"#1a243a",color:"#80c0ff",border:"1px solid #2a4060",borderRadius:3,padding:"1px 5px",letterSpacing:".04em"}}>NEW</span>}
+                          </span>
+                          <span style={{color:"#555",fontSize:11,textAlign:"right"}}>{fmtDate(item.date)}</span>
+                          <span style={{color:"#555",fontSize:11,textAlign:"right"}}>{fmt$(item.amount)}</span>
+                          <span style={{color:"#80c0ff",fontSize:12,fontWeight:500,textAlign:"right"}}>{fmt$(item.annualDepr)}</span>
+                        </div>
+                      );
+                    })}
+                    <div className="trow" style={{borderTop:"1px solid #252525",marginTop:7,paddingTop:7,display:"grid",gridTemplateColumns:"1fr auto auto auto",gap:"4px 16px"}}>
+                      <span style={{color:"#d4d0c8",fontWeight:500}}>Total Depreciation</span>
+                      <span/>
+                      <span/>
+                      <span style={{color:"#80c0ff",fontWeight:500,textAlign:"right"}}>{fmt$(taxData.totalDepreciation)}</span>
+                    </div>
+                  </>)}
+                </div>
 
                 {/* Rent by month */}
                 <div className="tsec">
@@ -726,7 +802,7 @@ export default function App() {
               </div>
 
               <div style={{background:"#141408",border:"1px solid #323218",borderRadius:6,padding:"12px 16px",marginTop:12,fontSize:12,color:"#666",lineHeight:1.7}}>
-                <strong style={{color:"#c8b870"}}>Note:</strong> Expenses &amp; repairs are deductible the year paid (Schedule E). Capital improvements depreciate over 27.5 yrs. Export CSV to share with your CPA.
+                <strong style={{color:"#c8b870"}}>Note:</strong> Expenses &amp; repairs are deductible the year paid (Schedule E). Capital improvements depreciate over 27.5 years using straight-line MACRS with mid-month convention — each improvement's annual deduction appears every tax year for the life of the asset. Net income above includes depreciation. Export CSV to share with your CPA.
               </div>
             </div>
           )}
